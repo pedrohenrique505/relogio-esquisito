@@ -1,6 +1,6 @@
 # Perfil do binário — `SLUS_216.61`
 
-Análise inicial da ISO **Ben 10: Protector of Earth (USA)** (PS2, NTSC-U).
+Análise da ISO **Ben 10: Protector of Earth (USA)** (PS2, NTSC-U).
 
 ## Identificação
 
@@ -12,6 +12,7 @@ Análise inicial da ISO **Ben 10: Protector of Earth (USA)** (PS2, NTSC-U).
 - **Entry point**: `0x00100008`
 - **Global pointer (`$gp`)**: `0x0025D3F0` (de `.reginfo`)
 - **Processador Ghidra**: `r5900:LE:32:default` (`ghidra-emotionengine-reloaded`)
+- **Contagem de funções**: 3.575 na auto-análise do Ghidra; **4.963 funções** e **15.911 labels** após `CreateGapFunctions.java` (20.874 funções geradas pelo `ps2_recomp`, 0 erros).
 
 ## Seções principais
 
@@ -27,18 +28,38 @@ Análise inicial da ISO **Ben 10: Protector of Earth (USA)** (PS2, NTSC-U).
 
 Não há `.gcc_except_table` (sem exceções C++ habilitadas).
 
-## Conteúdo do disco
+## Mapa de funções-chave (boot e SDK)
 
-- `SLUS_216.61` — executável principal do EE
-- `SYSTEM.CNF` — configuração de boot
-- `IOPRP300.IMG` — imagem IOP do Sony SDK 3.0
-- `GAME.DIR` (30 KB) e `GAME.WAD` (~2,45 GB) — índice e arquivo único de dados do jogo
-- `MODULES/` — 15 módulos IRX:
-  - Padrão Sony: `SIO2MAN.IRX`, `MTAPMAN.IRX`, `PADMAN.IRX`, `MCMAN.IRX`, `MCSERV.IRX`, `LIBSD.IRX`, `USBD.IRX`, `USBKB.IRX`
-  - Áudio / streaming / middleware: `CDARB.IRX`, `ALASD.IRX`, `SN_CDARB.IRX`, `SN_ALASD.IRX`, `CDVDSTM.IRX`, `SCREAM.IRX`, `STREAM.IRX`
+| Endereço | Papel | Observações |
+| --- | --- | --- |
+| `0x00100008` | `entry` | Zera `.sbss`/`.bss` (`0x00255400`–`0x00285FCC`), chama `InitMainThread` (stack 64 KB) / `InitHeap` (`-1`), construtores globais e `main()` |
+| `0x00133030` | `main` | Chama init (`0x00143660`) e loop principal (`0x00144B88`) |
+| `0x00142DC0` | `initIopAndCd` | `sceGsResetPath`, `sceDmaReset`, `sceVpu0Reset`, `sceSifRebootIop("cdrom0:\IOPRP300.IMG;1")`, `sceSifSyncIop`, reinicia SIF/FS/CD |
+| `0x0012B7A0` | `initGameWad` | Lê `cdrom0:\GAME.DIR` (tabela de entradas de `0x48` bytes) e chama `sceCdSearchFile("\GAME.WAD;1")` |
+| `0x0012FD30` | `loadBootIrx` | Carrega 8 IRXs via `0x0012FCD8` (`sceSifLoadModule`): `SIO2MAN`, `MTAPMAN`, `PADMAN`, `MCMAN`, `MCSERV`, `LIBSD`, `CDARB`, `ALASD` |
+| `0x001C3920` | `sceCdSearchFile` | Não detectada pelo `ps2_analyzer`; ligada via override com consulta ISO-9660 real |
+| `0x001C53A8` | `write` (libkernel) | TTY DECI2; substituída por `ttyWrite` para `stdout`/`stderr` do host |
+| `0x001C82B0` | `sceSifBindRpc` | Override bloqueante que avança ciclos EE/IOP até o servidor IOP registrar o SID |
+| `0x001CA248` | `_sceSifLoadModule` | Override que pula os 5 IRXs padrão já cobertos por HLE e carrega `LIBSD`, `CDARB` e `ALASD` no IOP |
+| `0x001A4C58` | `__pure_virtual` | Thunk `j 0x001A5C18; nop` (`terminate` → `0x001A5C08`) |
 
-## Bibliotecas e indícios encontrados nas strings
+## Memória e heap
 
-- **Sony PS2 SDK 3.0**: `libgraph` (`sceGs*`), `libpad`, `libmc`, `sceCd*`, `sceSif*`
-- **Bink Video**: `CBinkPlayer` (vídeos anamórficos 16:9 / 4:3)
-- **Scripting interno**: funções `ass_*` (inclusive referências compartilhadas com a versão de Wii, ex.: `ass_WiiIsBatteryCritical`)
+- O alocador do jogo consome acima de `0x01ED89F8` ainda no carregamento inicial (parser de chunks RIFF em `FUN_001dca08` / `FUN_001d7240`).
+- No PS2 real, `InitHeap(..., -1)` entrega até `0x01FF0000` (abaixo da stack de 64 KB). No `ps2xRuntime`, o limite padrão `0x01F00000` estoura o heap; o patch `0038` sobe o limite para `0x01FA0000` (+640 KB).
+
+## Conteúdo do disco e LSNs reais (ISO-9660)
+
+- `SLUS_216.61` (LSN `0x192B15`) — executável principal do EE
+- `SYSTEM.CNF` (LSN `0x192DE1`) — configuração de boot
+- `IOPRP300.IMG` (LSN `0x192A8E`) — imagem IOP do Sony SDK 3.0
+- `GAME.DIR` (LSN `0x06DDD0`, 30 KB) e `GAME.WAD` (LSN `0x06DDDF`, ~2,45 GB) — índice e arquivo único de dados do jogo; o `CDARB.IRX` lê diretamente por LSN real da ISO
+- `MODULES/` — 15 módulos IRX no disco (8 carregados no boot):
+  - Padrão Sony (HLE no runtime): `SIO2MAN.IRX`, `MTAPMAN.IRX`, `PADMAN.IRX`, `MCMAN.IRX`, `MCSERV.IRX`, `USBD.IRX`, `USBKB.IRX`
+  - Áudio / CD / middleware (emulados no IOP): `LIBSD.IRX`, `CDARB.IRX`, `ALASD.IRX` (e presentes no disco: `SN_CDARB.IRX`, `SN_ALASD.IRX`, `CDVDSTM.IRX`, `SCREAM.IRX`, `STREAM.IRX`)
+
+## Bibliotecas e middleware
+
+- **Sony PS2 SDK 3.0**: 322 símbolos reconhecidos pelo `ps2_analyzer`, dos quais 113 ativos como bindings HLE (`libgraph`, `libdma`, `libpad`, `libmc`, `libcdvd`, `sifrpc`, `sifcmd`, `libvu0`).
+- **Bink Video**: `CBinkPlayer` (vídeos anamórficos 16:9 / 4:3).
+- **Scripting interno**: funções `ass_*` (inclusive referências compartilhadas com a versão de Wii, ex.: `ass_WiiIsBatteryCritical`).

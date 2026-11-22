@@ -6,8 +6,9 @@ Recompilação estática de **Ben 10: Protector of Earth** (PS2, NTSC-U, `SLUS-2
 
 ## Estado atual
 
-**Menu inicial funcionando em 60 FPS no Linux (paraLLEl-GS / Vulkan).**
-- Boot completo, leitura real de `GAME.DIR` / `GAME.WAD` via `CDARB.IRX` no IOP emulado, carregamento de `LIBSD.IRX` e `ALASD.IRX`, checagem de Memory Card (`/BASLUS-21661`) e renderização nítida (`640x448`) até o menu inicial (`New Game`).
+**Menu inicial alcançado no Linux (paraLLEl-GS / Vulkan, `640x448`).**
+- Boot completo, leitura real de `GAME.DIR` / `GAME.WAD` via `CDARB.IRX` no IOP emulado, carregamento de `LIBSD.IRX` e `ALASD.IRX`, checagem de Memory Card (`/BASLUS-21661`) e renderização nítida até a tela `New Game` (~45–57 Hz no carregamento/animação e 60 Hz de scanout).
+- Pendência conhecida em investigação: `JALR target=0x0` em `FUN_001ee0f8` (`0x001EE138`, rotina de áudio) após ~15 s ocioso no menu.
 - Veja o diário detalhado em [`progression/2026-11-22-menu-inicial.md`](progression/2026-11-22-menu-inicial.md) e o perfil do binário em [`docs/binario.md`](docs/binario.md).
 
 ## Estrutura do repositório
