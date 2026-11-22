@@ -1,0 +1,163 @@
+diff --git i/ps2xIOP/include/ps2x/iop/iop_host.h w/ps2xIOP/include/ps2x/iop/iop_host.h
+index 951c87e..8dbf2d1 100644
+--- i/ps2xIOP/include/ps2x/iop/iop_host.h
++++ w/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -7,6 +7,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <span>
+ #include <string>
+ #include <string_view>
+
+@@ -96,6 +97,7 @@ namespace ps2x::iop
+         virtual uint32_t allocateGuest(uint32_t size, uint32_t alignment) = 0;
+         virtual void freeGuest(uint32_t address) = 0;
+
++        virtual void submitSpuAudio(std::span<const int16_t>) noexcept {}
+         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
+
+         virtual std::string hostPath(HostPathKind kind) const = 0;
+diff --git i/ps2xIOP/src/emulator/iop_emulator.cpp w/ps2xIOP/src/emulator/iop_emulator.cpp
+index 20d5692..e86606b 100644
+--- i/ps2xIOP/src/emulator/iop_emulator.cpp
++++ w/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -129,6 +129,8 @@ namespace ps2x::iop::detail
+             nextModuleId = 1;
+             moduleCursor = kModuleLoadBase;
+             totalCycles = 0;
++            spuCycles = 0;
++            spuAudioSize = 0;
+             totalInstructions = 0;
+             eeCycleCarry = 0;
+             activeCpu = nullptr;
+@@ -564,6 +566,26 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+
++        void advanceSpu()
++        {
++            // The IOP clock is 36.864 MHz and the SPU2 mixes at 48 kHz.
++            constexpr uint64_t cyclesPerSample = 768;
++            while (totalCycles - spuCycles >= cyclesPerSample)
++            {
++                spuCycles += cyclesPerSample;
++                memory.mixSpuFrame(std::span<int16_t, 2>{spuAudio.data() + spuAudioSize, 2});
++                spuAudioSize += 2;
++                if (spuAudioSize == spuAudio.size())
++                {
++                    host.submitSpuAudio(spuAudio);
++                    spuAudioSize = 0;
++                }
++            }
++
++            if (memory.takeSpuInterrupt())
++                (void)intrman.dispatchInterrupt(9, *this);
++        }
++
+         void runCycles(uint64_t cycles) noexcept
+         {
+             try
+@@ -571,6 +593,7 @@ namespace ps2x::iop::detail
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
++                    advanceSpu();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this);
+@@ -592,6 +615,7 @@ namespace ps2x::iop::detail
+                     if (totalCycles == before)
+                         ++totalCycles;
+                 }
++                advanceSpu();
+             }
+             catch (...)
+             {
+@@ -689,6 +713,9 @@ namespace ps2x::iop::detail
+             return true;
+         }
+
++        uint64_t spuCycles = 0;
++        std::array<int16_t, 512 * 2> spuAudio{};
++        size_t spuAudioSize = 0;
+         IopHost &host;
+         IopMemory memory;
+         IopSysmem sysmem;
+diff --git i/ps2xRuntime/src/lib/ps2_iop_host.cpp w/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index ba64fea..0653f12 100644
+--- i/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ w/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -84,6 +84,10 @@ PS2IopHostAdapter::PS2IopHostAdapter(PS2Runtime &runtime)
+
+ PS2IopHostAdapter::~PS2IopHostAdapter()
+ {
++#if !defined(PLATFORM_VITA)
++    if (m_spuStream.buffer)
++        UnloadAudioStream(m_spuStream);
++#endif
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     for (auto &[handle, file] : m_hostFiles)
+     {
+@@ -245,6 +249,31 @@ void PS2IopHostAdapter::freeGuest(uint32_t address)
+     m_runtime.guestFree(address);
+ }
+
++void PS2IopHostAdapter::submitSpuAudio(std::span<const int16_t> samples) noexcept
++{
++#if defined(PLATFORM_VITA)
++    (void)samples;
++#else
++    if (!IsAudioDeviceReady())
++        return;
++
++    const int frames = static_cast<int>(samples.size() / 2);
++    if (!m_spuStream.buffer)
++    {
++        if (std::none_of(samples.begin(), samples.end(), [](int16_t sample) { return sample != 0; }))
++            return;
++        SetAudioStreamBufferSizeDefault(frames);
++        m_spuStream = LoadAudioStream(48000, 16, 2);
++        SetAudioStreamBufferSizeDefault(0);
++        if (!m_spuStream.buffer)
++            return;
++        PlayAudioStream(m_spuStream);
++    }
++    if (IsAudioStreamProcessed(m_spuStream))
++        UpdateAudioStream(m_spuStream, samples.data(), frames);
++#endif
++}
++
+ void PS2IopHostAdapter::audioCommand(uint32_t sid,
+                                      uint32_t function,
+                                      ps2x::iop::GuestBuffer send,
+diff --git i/ps2xRuntime/src/lib/ps2_iop_host.h w/ps2xRuntime/src/lib/ps2_iop_host.h
+index 51031ae..8ed1c83 100644
+--- i/ps2xRuntime/src/lib/ps2_iop_host.h
++++ w/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -1,6 +1,7 @@
+ #pragma once
+
+ #include "ps2x/iop/iop_host.h"
++#include "ps2_host_backend.h"
+
+ #include <cstdint>
+ #include <cstdio>
+@@ -56,6 +57,7 @@ public:
+     uint32_t allocateGuest(uint32_t size, uint32_t alignment) override;
+     void freeGuest(uint32_t address) override;
+
++    void submitSpuAudio(std::span<const int16_t> samples) noexcept override;
+     void audioCommand(uint32_t sid,
+                       uint32_t function,
+                       ps2x::iop::GuestBuffer send,
+@@ -97,6 +99,9 @@ private:
+
+     bool guestRange(uint32_t address, size_t size, uint8_t *&begin) const;
+
++#if !defined(PLATFORM_VITA)
++    AudioStream m_spuStream{};
++#endif
+     PS2Runtime &m_runtime;
+     std::recursive_mutex m_callMutex;
+     R5900Context *m_activeContext = nullptr;
