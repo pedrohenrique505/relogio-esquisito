@@ -1,0 +1,96 @@
+diff --git i/ps2xIOP/src/emulator/core/iop_memory.cpp w/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..d4f9139 100644
+--- i/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ w/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -9,6 +9,9 @@ namespace ps2x::iop::detail
+     {
+         constexpr uint32_t kDmaSpu0Chcr = 0x1F8010C8u;
+         constexpr uint32_t kDmaSpu1Chcr = 0x1F801508u;
++        constexpr uint32_t kSpuRamWords = 1u << 20;
++        constexpr uint32_t kSpuRamMask = kSpuRamWords - 1u;
++        constexpr uint32_t kSpuTransferAddress = 0x1F9001A8u;
+         constexpr uint32_t kDmaStart = 1u << 24u;
+         constexpr int kDmaSpu0Irq = 0x24;
+         constexpr int kDmaSpu1Irq = 0x28;
+@@ -20,7 +23,7 @@ namespace ps2x::iop::detail
+     }
+
+     IopMemory::IopMemory()
+-        : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize)
++        : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize), m_spuRam(kSpuRamWords)
+     {
+         reset();
+     }
+@@ -30,6 +33,7 @@ namespace ps2x::iop::detail
+         std::fill(m_ram.begin(), m_ram.end(), uint8_t{0});
+         std::fill(m_owned.begin(), m_owned.end(), uint8_t{0});
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
++        std::fill(m_spuRam.begin(), m_spuRam.end(), uint16_t{0});
+         m_hardware.clear();
+         m_allocations.clear();
+         m_heapCursor = HeapBase;
+@@ -253,7 +257,8 @@ namespace ps2x::iop::detail
+         const bool secondCore = address == kDmaSpu1Chcr;
+         m_hardware[address] = value & ~kDmaStart;
+
+-        const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
++        const uint32_t coreOffset = secondCore ? 0x400u : 0u;
++        const uint32_t statusAddress = 0x1F900344u + coreOffset;
+         const uint32_t alignedStatus = statusAddress & ~3u;
+         const uint32_t shift = (statusAddress & 2u) * 8u;
+         uint32_t status = 0u;
+@@ -269,12 +274,37 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        transferSpuDma(address, coreOffset, value, transferWords);
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+             std::max<uint64_t>(transferWords * 2u, 64u),
+         };
+     }
+
++    void IopMemory::transferSpuDma(uint32_t channel, uint32_t coreOffset, uint32_t control, uint64_t words)
++    {
++        // MADR is a byte address in IOP RAM. TSA is a halfword address in sound RAM.
++        const uint32_t iopAddress = readHardware32(channel - 8u) & 0x00FFFFFCu;
++        const uint32_t tsa = readHardware32(kSpuTransferAddress + coreOffset);
++        const uint32_t soundAddress = ((tsa << 16u) | (tsa >> 16u)) & kSpuRamMask;
++        if (iopAddress >= RamSize || words > (RamSize - iopAddress) / sizeof(uint32_t))
++            return;
++
++        const size_t halfwords = static_cast<size_t>(words) * 2u;
++        for (size_t index = 0; index < halfwords; ++index)
++        {
++            uint8_t *iop = m_ram.data() + iopAddress + index * sizeof(uint16_t);
++            uint16_t &sound = m_spuRam[(soundAddress + index) & kSpuRamMask];
++            if (control & 1u)
++                std::memcpy(&sound, iop, sizeof(sound));
++            else
++                std::memcpy(iop, &sound, sizeof(sound));
++        }
++        if ((control & 1u) == 0u)
++            markOwned(iopAddress, halfwords * sizeof(uint16_t));
++        m_hardware[channel - 8u] = iopAddress + halfwords * sizeof(uint16_t);
++    }
++
+     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
+     {
+         std::optional<DmaStart> result = m_dmaStart;
+diff --git i/ps2xIOP/src/emulator/core/iop_memory.h w/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..48531dc 100644
+--- i/ps2xIOP/src/emulator/core/iop_memory.h
++++ w/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -76,10 +76,12 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
++        void transferSpuDma(uint32_t channel, uint32_t coreOffset, uint32_t control, uint64_t words);
+
+         std::vector<uint8_t> m_ram;
+         std::vector<uint8_t> m_owned;
+         std::vector<uint8_t> m_scratch;
++        std::vector<uint16_t> m_spuRam;
+         std::unordered_map<uint32_t, uint32_t> m_hardware;
+         std::vector<Allocation> m_allocations;
+         uint32_t m_heapCursor = HeapBase;
