@@ -57,8 +57,6 @@ Pastas locais (ignoradas pelo `.gitignore`):
      -DBEN10_ENABLE_PARALLEL_GS=ON
    cmake --build build --target ben10poe -j5
 
-   cd game && \
-   BEN10_ISO="/caminho/para/Ben 10 - Protector of Earth (USA).iso" \
-   BEN10_GS_BACKEND=gpu-present \
-   ../build/ben10poe "$PWD/SLUS_216.61"
+   ./tools/run.sh "/caminho/para/Ben 10 - Protector of Earth (USA).iso"
    ```
+   (Ou apenas `./tools/run.sh` se a ISO estiver no caminho padrão em `~/Downloads/Ben 10 - Protector of Earth (USA)/`.)
