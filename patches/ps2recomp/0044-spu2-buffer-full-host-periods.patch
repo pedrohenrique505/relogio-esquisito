@@ -1,0 +1,13 @@
+diff --git i/ps2xIOP/src/emulator/iop_emulator.cpp w/ps2xIOP/src/emulator/iop_emulator.cpp
+index e86606b..a0fef2e 100644
+--- i/ps2xIOP/src/emulator/iop_emulator.cpp
++++ w/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -714,7 +714,7 @@ namespace ps2x::iop::detail
+         }
+
+         uint64_t spuCycles = 0;
+-        std::array<int16_t, 512 * 2> spuAudio{};
++        std::array<int16_t, 2048 * 2> spuAudio{};
+         size_t spuAudioSize = 0;
+         IopHost &host;
+         IopMemory memory;
