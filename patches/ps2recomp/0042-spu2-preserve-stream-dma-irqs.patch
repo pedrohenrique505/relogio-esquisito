@@ -1,0 +1,49 @@
+diff --git i/ps2xIOP/src/emulator/core/iop_memory.cpp w/ps2xIOP/src/emulator/core/iop_memory.cpp
+index db39e83..6f5ffb5 100644
+--- i/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ w/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -339,12 +339,6 @@ namespace ps2x::iop::detail
+             const uint32_t next = (word + 1u) & kSpuRamMask;
+             m_hardware[tsa] = (next << 16u) | (next >> 16u);
+         }
+-        if (reg >= 0x1C4u && reg < 0x2E0u && (reg - 0x1C4u) % 12u < 4u)
+-        {
+-            // Streaming drivers can redirect an active voice at the next loop.
+-            const size_t index = (reg - 0x1C4u) / 12u;
+-            m_spuVoices[core][index].loop = spuAddress(aligned) & ~7u;
+-        }
+         if (reg < 0x1A0u || reg > 0x1A6u || value == 0u)
+             return;
+
+@@ -488,8 +482,7 @@ namespace ps2x::iop::detail
+         {
+             uint8_t *iop = m_ram.data() + iopAddress + index * sizeof(uint16_t);
+             const uint32_t wordAddress = (soundAddress + index) & kSpuRamMask;
+-            if (index != 0u)
+-                checkSpuInterrupt(wordAddress);
++            checkSpuInterrupt(wordAddress);
+             uint16_t &sound = m_spuRam[wordAddress];
+             if (control & 1u)
+                 std::memcpy(&sound, iop, sizeof(sound));
+diff --git i/ps2xIOP/tests/iop_import_tests.cpp w/ps2xIOP/tests/iop_import_tests.cpp
+index 391284d..f81d1e1 100644
+--- i/ps2xIOP/tests/iop_import_tests.cpp
++++ w/ps2xIOP/tests/iop_import_tests.cpp
+@@ -110,12 +110,16 @@ namespace
+         };
+         if (!expect(memory.writeRam(0x1000u, block.data(), sizeof(block)), "could not seed SPU DMA source"))
+             return false;
++        memory.write32(base + 0x19Cu, sampleAddress << 16u);
++        memory.write16(base + 0x19Au, 0x8040u);
+         memory.write32(base + 0x1A8u, sampleAddress << 16u);
+         memory.write32(0x1F8010C0u, 0x1000u);
+         memory.write32(0x1F8010C4u, 0x00010004u);
+         memory.write32(0x1F8010C8u, 0x01000201u);
+-        if (!expect(memory.takeDmaStart().has_value(), "SPU DMA did not schedule completion"))
++        if (!expect(memory.takeDmaStart().has_value(), "SPU DMA did not schedule completion") ||
++            !expect(memory.takeSpuInterrupt(), "SPU DMA did not signal an IRQ at the first sound RAM word"))
+             return false;
++        memory.write16(base + 0x19Au, 0x8000u);
+
+         memory.write32(base + 0x1C0u, sampleAddress << 16u);
+         memory.write16(base, 0x2000u);
