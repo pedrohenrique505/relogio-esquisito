@@ -14,7 +14,12 @@
 #include "ps2_syscalls.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu1.h"
 #include "ps2_recompiled_functions.h"
+
+using Ps2Vu1NativeFn = bool (*)(uint64_t codeHash, VU1State &st, uint8_t *vuData, uint32_t dataSize,
+                                GS &gs, PS2Memory *memory, uint64_t *outGifHash, uint64_t *outGifBytes, bool replaySink);
+void ps2_vu1_register_native_executor(Ps2Vu1NativeFn fn);
 
 #include <chrono>
 #include <cstdio>
@@ -404,6 +409,46 @@ namespace
         runtime.replaceFunction(0x001C82B0u, sifBindRpcBlocking);
         runtime.replaceFunction(0x001C8490u, sifCallRpcTraced);
         runtime.replaceFunction(0x001CA248u, sifLoadModuleFiltered);
+
+        if (const char *vuDumpDir = std::getenv("BEN10_DUMP_VU1"); vuDumpDir && *vuDumpDir)
+        {
+            static std::string g_vuDumpDir(vuDumpDir);
+            static std::unordered_map<uint64_t, uint64_t> g_hashCalls;
+            static std::unordered_map<uint64_t, uint64_t> g_hashPcCalls;
+            static uint64_t g_totalCalls = 0;
+            std::atexit([]() {
+                std::fprintf(stderr, "[ben10-vu1] total_calls=%llu unique_hashes=%zu\n",
+                             (unsigned long long)g_totalCalls, g_hashCalls.size());
+                for (const auto &[h, c] : g_hashCalls)
+                    std::fprintf(stderr, "[ben10-vu1] hash=%016llx calls=%llu\n",
+                                 (unsigned long long)h, (unsigned long long)c);
+                for (const auto &[k, c] : g_hashPcCalls)
+                    if (c >= 100)
+                        std::fprintf(stderr, "[ben10-vu1] hash=%012llx.. pc=0x%04x calls=%llu\n",
+                                     (unsigned long long)(k >> 16), (unsigned)(k & 0xFFFFu), (unsigned long long)c);
+            });
+            ps2_vu1_register_native_executor([](uint64_t codeHash, VU1State &st, uint8_t *, uint32_t,
+                                                GS &, PS2Memory *memory, uint64_t *, uint64_t *, bool) -> bool {
+                ++g_totalCalls;
+                auto &cnt = g_hashCalls[codeHash];
+                if (cnt == 0 && memory && memory->getVU1Code())
+                {
+                    char fname[512];
+                    std::snprintf(fname, sizeof(fname), "%s/vu1_%016llx.bin",
+                                  g_vuDumpDir.c_str(), (unsigned long long)codeHash);
+                    if (FILE *f = std::fopen(fname, "wb"))
+                    {
+                        std::fwrite(memory->getVU1Code(), 1, PS2_VU1_CODE_SIZE, f);
+                        std::fclose(f);
+                        std::fprintf(stderr, "[ben10-vu1] dumped %s (first pc=0x%04x)\n", fname, st.pc);
+                    }
+                }
+                ++cnt;
+                const uint64_t key = ((codeHash & 0xFFFFFFFFFFFFull) << 16) | (st.pc & 0xFFFFu);
+                ++g_hashPcCalls[key];
+                return false;
+            });
+        }
     }
 } // namespace
 
