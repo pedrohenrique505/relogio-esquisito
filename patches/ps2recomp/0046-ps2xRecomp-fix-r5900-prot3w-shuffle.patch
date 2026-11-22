@@ -1,0 +1,13 @@
+diff --git i/ps2xRecomp/src/lib/mmi_translation_helpers.cpp w/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+index a2bcb77..34b8696 100644
+--- i/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
++++ w/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+@@ -521,7 +521,7 @@ namespace ps2recomp
+     std::string CodeGenerator::translatePROT3W(const Instruction &inst)
+     {
+         // Rotates words left by 3: [d,c,b,a] -> [a,d,c,b]
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(0,3,2,1)));",
++        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,2,1)));",
+                            inst.rd, inst.rt);
+     }
+ 
