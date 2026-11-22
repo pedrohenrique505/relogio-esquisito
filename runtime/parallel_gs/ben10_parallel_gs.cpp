@@ -599,6 +599,24 @@ public:
                          static_cast<unsigned long long>(m_stats.presentedFrames),
                          outW, h, static_cast<unsigned long long>(hash));
         }
+        static const char *dumpPath = std::getenv("BEN10_DUMP_FRAME");
+        if (dumpPath && *dumpPath && (m_stats.presentedFrames % 60u) == 30u && !m_presentScratch.empty())
+        {
+            if (FILE *fp = std::fopen(dumpPath, "wb"))
+            {
+                std::fprintf(fp, "P6\n%u %u\n255\n", outW, h);
+                std::vector<uint8_t> rgb;
+                rgb.resize(static_cast<size_t>(outW) * h * 3u);
+                for (size_t i = 0, j = 0; i + 3 < m_presentScratch.size(); i += 4, j += 3)
+                {
+                    rgb[j + 0] = m_presentScratch[i + 0];
+                    rgb[j + 1] = m_presentScratch[i + 1];
+                    rgb[j + 2] = m_presentScratch[i + 2];
+                }
+                std::fwrite(rgb.data(), 1, rgb.size(), fp);
+                std::fclose(fp);
+            }
+        }
         {
             std::lock_guard<std::mutex> plock(m_presentMutex);
             m_presentFrame.swap(m_presentScratch);
