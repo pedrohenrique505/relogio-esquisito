@@ -389,6 +389,9 @@ namespace
         std::fprintf(stderr, "[ben10] %zu/%zu SDK bindings aplicados\n", bound, std::size(kSdkBindings));
 
         // Overrides específicos (depois dos bindings genéricos do SDK)
+        // Retoma o loop após o checkpoint mantendo a tabela completa do JR em
+        // 0x185BFC. A entrada sintética termina antes de destinos como 0x186360.
+        runtime.replaceFunction(0x00185BC8u, FUN_00185ba0_0x185ba0);
         // 0x14b820 ficou 8 bytes dentro de FUN_0014b818 (que começa com addiu $sp,+0x10; nop)
         runtime.replaceFunction(0x0014B820u, [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt) {
             ctx->r[29] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(getRegU32(ctx, 29) - 0x10u)));
