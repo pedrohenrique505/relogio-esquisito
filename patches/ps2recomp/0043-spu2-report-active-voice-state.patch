@@ -1,0 +1,48 @@
+diff --git i/ps2xIOP/src/emulator/core/iop_memory.cpp w/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 6f5ffb5..6dab4c4 100644
+--- i/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ w/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -249,12 +249,22 @@ namespace ps2x::iop::detail
+         {
+             const auto &voice = m_spuVoices[offset >> 10u][(reg - 0x1C8u) / 12u];
+             const size_t sample = std::min(voice.sample, voice.samples.size() - 1u);
++            // NAX follows the decoder's read-ahead, even when pitch is zero.
++            constexpr uint32_t firstBufferedWord = 5u;
++            const uint32_t decodedWord = firstBufferedWord + sample / 4u;
+             const uint32_t word = voice.active && voice.sample < voice.samples.size()
+-                ? (voice.address - 7u + sample / 4u) & kSpuRamMask
++                ? (voice.address - 8u + decodedWord + (decodedWord >= 8u ? 1u : 0u)) & kSpuRamMask
+                 : voice.address;
+             return (word << 16u) | (word >> 16u);
+         }
+         const auto value = m_hardware.find(address);
++        if (offset < 0x800u && reg < 0x180u && (reg & 0xFu) == 8u)
++        {
++            const auto &voice = m_spuVoices[offset >> 10u][reg >> 4u];
++            const uint32_t adsr2 = value == m_hardware.end() ? 0u : value->second & 0xFFFFu;
++            // The mixer uses a fixed envelope while a voice is active.
++            return adsr2 | (voice.active ? 0x7FFF0000u : 0u);
++        }
+         if (value != m_hardware.end())
+             return value->second;
+         switch (address)
+diff --git i/ps2xIOP/tests/iop_import_tests.cpp w/ps2xIOP/tests/iop_import_tests.cpp
+index f81d1e1..00c19fb 100644
+--- i/ps2xIOP/tests/iop_import_tests.cpp
++++ w/ps2xIOP/tests/iop_import_tests.cpp
+@@ -138,10 +138,14 @@ namespace
+             if (!expect(output[0] == 1024 && output[1] == 512, "SPU decoded or mixed the DMA block incorrectly") ||
+                 !expect(memory.takeSpuInterrupt() == (i == 0), "SPU address IRQ did not latch once"))
+                 return false;
++            if (i == 0 && (!expect(memory.read16(base + 0xAu) == 0x7FFFu, "active SPU voice reported a silent envelope") ||
++                           !expect(memory.read16(base + 0x1CAu) == sampleAddress + 5u, "SPU NAX omitted decoder read-ahead")))
++                return false;
+         }
+         memory.mixSpuFrame(output);
+         return expect(output[0] == 0 && output[1] == 0, "SPU voice played past the end flag") &&
+-               expect((memory.read16(base + 0x340u) & 1u) == 1u, "SPU voice did not set ENDX");
++               expect((memory.read16(base + 0x340u) & 1u) == 1u, "SPU voice did not set ENDX") &&
++               expect(memory.read16(base + 0xAu) == 0u, "stopped SPU voice reported a nonzero envelope");
+     }
+
+     bool testLoadcoreRebootLibraryMode()
