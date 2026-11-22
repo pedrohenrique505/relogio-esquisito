@@ -1,0 +1,389 @@
+diff --git i/ps2xIOP/src/emulator/core/iop_memory.cpp w/ps2xIOP/src/emulator/core/iop_memory.cpp
+index d4f9139..db39e83 100644
+--- i/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ w/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -35,6 +35,8 @@ namespace ps2x::iop::detail
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
+         std::fill(m_spuRam.begin(), m_spuRam.end(), uint16_t{0});
+         m_hardware.clear();
++        m_spuVoices = {};
++        m_spuInterrupt = false;
+         m_allocations.clear();
+         m_heapCursor = HeapBase;
+         m_interruptStatus = 0;
+@@ -95,6 +97,12 @@ namespace ps2x::iop::detail
+                (static_cast<uint32_t>(read8(address + 3u)) << 24u);
+     }
+
++    uint32_t IopMemory::spuAddress(uint32_t registerAddress) const
++    {
++        const uint32_t value = readHardware32(registerAddress);
++        return ((value << 16u) | (value >> 16u)) & kSpuRamMask;
++    }
++
+     void IopMemory::write8(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+@@ -113,6 +121,12 @@ namespace ps2x::iop::detail
+         uint32_t current = readHardware32(aligned);
+         const uint32_t shift = (phys & 3u) * 8u;
+         current = (current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift);
++        if (phys >= Spu2Base && phys < Spu2Base + 0x800u)
++        {
++            const uint32_t halfwordShift = (phys & 2u) * 8u;
++            writeSpuRegister(phys & ~1u, static_cast<uint16_t>(current >> halfwordShift));
++            return;
++        }
+         writeHardware32(aligned, current);
+     }
+
+@@ -125,6 +139,11 @@ namespace ps2x::iop::detail
+             markOwned(phys, sizeof(value));
+             return;
+         }
++        if ((phys & 1u) == 0 && phys >= Spu2Base && phys < Spu2Base + 0x800u)
++        {
++            writeSpuRegister(phys, value);
++            return;
++        }
+         write8(address, static_cast<uint8_t>(value));
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+     }
+@@ -145,6 +164,12 @@ namespace ps2x::iop::detail
+         }
+         if ((phys & 3u) == 0u)
+         {
++            if (phys >= Spu2Base && phys < Spu2Base + 0x800u)
++            {
++                writeSpuRegister(phys, static_cast<uint16_t>(value));
++                writeSpuRegister(phys + 2u, static_cast<uint16_t>(value >> 16u));
++                return;
++            }
+             writeHardware32(phys, value);
+             return;
+         }
+@@ -217,6 +242,18 @@ namespace ps2x::iop::detail
+
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        const uint32_t offset = address - Spu2Base;
++        const uint32_t reg = offset & 0x3FFu;
++        if (offset < 0x800u && reg >= 0x1C8u && reg < 0x2E0u &&
++            (reg - 0x1C8u) % 12u == 0u)
++        {
++            const auto &voice = m_spuVoices[offset >> 10u][(reg - 0x1C8u) / 12u];
++            const size_t sample = std::min(voice.sample, voice.samples.size() - 1u);
++            const uint32_t word = voice.active && voice.sample < voice.samples.size()
++                ? (voice.address - 7u + sample / 4u) & kSpuRamMask
++                : voice.address;
++            return (word << 16u) | (word >> 16u);
++        }
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+@@ -281,12 +318,168 @@ namespace ps2x::iop::detail
+         };
+     }
+
++    void IopMemory::writeSpuRegister(uint32_t address, uint16_t value)
++    {
++        const uint32_t aligned = address & ~3u;
++        const uint32_t shift = (address & 2u) * 8u;
++        m_hardware[aligned] = (readHardware32(aligned) & ~(0xFFFFu << shift)) |
++                              (static_cast<uint32_t>(value) << shift);
++        const uint32_t core = (address >> 10u) & 1u;
++        const uint32_t coreOffset = core * 0x400u;
++        const uint32_t reg = address & 0x3FFu;
++        if (reg == 0x19Au && (value & 0x40u) == 0u)
++            m_hardware[Spu2Base + 0x7C0u] &= ~(1u << (18u + core));
++        if (reg == 0x1ACu)
++        {
++            // Manual transfer writes one halfword and advances the transfer address.
++            const uint32_t tsa = kSpuTransferAddress + coreOffset;
++            const uint32_t word = spuAddress(tsa);
++            m_spuRam[word] = value;
++            checkSpuInterrupt(word);
++            const uint32_t next = (word + 1u) & kSpuRamMask;
++            m_hardware[tsa] = (next << 16u) | (next >> 16u);
++        }
++        if (reg >= 0x1C4u && reg < 0x2E0u && (reg - 0x1C4u) % 12u < 4u)
++        {
++            // Streaming drivers can redirect an active voice at the next loop.
++            const size_t index = (reg - 0x1C4u) / 12u;
++            m_spuVoices[core][index].loop = spuAddress(aligned) & ~7u;
++        }
++        if (reg < 0x1A0u || reg > 0x1A6u || value == 0u)
++            return;
++
++        const size_t first = (reg & 2u) ? 16u : 0u;
++        for (size_t index = first; index < std::min(first + 16u, size_t{24}); ++index)
++        {
++            if ((value & (1u << (index - first))) == 0u)
++                continue;
++            auto &voice = m_spuVoices[core][index];
++            if ((reg & 4u) != 0u)
++            {
++                finishSpuVoice(coreOffset, index);
++                continue;
++            }
++            voice = {};
++            voice.address = spuAddress(Spu2Base + coreOffset + 0x1C0u + 12u * index) & ~7u;
++            voice.loop = spuAddress(Spu2Base + coreOffset + 0x1C4u + 12u * index) & ~7u;
++            voice.active = true;
++            m_hardware[Spu2Base + coreOffset + 0x340u] &= ~(1u << index);
++        }
++    }
++
++    void IopMemory::checkSpuInterrupt(uint32_t wordAddress)
++    {
++        for (uint32_t core = 0; core < 2; ++core)
++        {
++            const uint32_t base = Spu2Base + core * 0x400u;
++            const uint32_t flag = 1u << (18u + core);
++            if ((readHardware32(base + 0x198u) & (0x40u << 16u)) != 0u &&
++                (readHardware32(Spu2Base + 0x7C0u) & flag) == 0u &&
++                spuAddress(base + 0x19Cu) == wordAddress)
++            {
++                m_hardware[Spu2Base + 0x7C0u] |= flag;
++                m_spuInterrupt = true;
++            }
++        }
++    }
++
++    bool IopMemory::takeSpuInterrupt() noexcept
++    {
++        const bool pending = m_spuInterrupt;
++        m_spuInterrupt = false;
++        return pending;
++    }
++
++    void IopMemory::decodeSpuBlock(SpuVoice &voice)
++    {
++        constexpr int filter[][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
++        const uint16_t header = m_spuRam[voice.address];
++        const uint32_t shift = (header & 15u) > 12u ? 9u : header & 15u;
++        const uint32_t predictor = (header >> 4u) & 7u;
++        voice.flags = static_cast<uint8_t>(header >> 8u);
++        if ((voice.flags & 4u) != 0u)
++            voice.loop = voice.address;
++        for (uint32_t word = 0; word < 8; ++word)
++            checkSpuInterrupt((voice.address + word) & kSpuRamMask);
++
++        for (size_t index = 0; index < voice.samples.size(); ++index)
++        {
++            const uint16_t data = m_spuRam[(voice.address + 1u + index / 4u) & kSpuRamMask];
++            const int nibble = (data >> ((index % 4u) * 4u)) & 15u;
++            const int raw = nibble < 8 ? nibble : nibble - 16;
++            const auto &coefficients = filter[predictor < 5u ? predictor : 0u];
++            const int predicted = (voice.history * coefficients[0] +
++                                   voice.older * coefficients[1] + 32) >> 6;
++            const int decoded = std::clamp(raw * (1 << (12u - shift)) + predicted, -32768, 32767);
++            voice.older = voice.history;
++            voice.history = decoded;
++            voice.samples[index] = static_cast<int16_t>(decoded);
++        }
++        voice.sample = 0;
++        voice.address = (voice.address + 8u) & kSpuRamMask;
++    }
++
++    void IopMemory::finishSpuVoice(uint32_t coreOffset, size_t index)
++    {
++        m_spuVoices[coreOffset / 0x400u][index].active = false;
++        m_hardware[Spu2Base + coreOffset + 0x340u] |= 1u << index;
++    }
++
++    void IopMemory::mixSpuFrame(std::span<int16_t, 2> output)
++    {
++        int32_t mix[2]{};
++        for (uint32_t core = 0; core < 2; ++core)
++        {
++            const uint32_t offset = core * 0x400u;
++            const uint32_t base = Spu2Base + offset;
++            for (size_t index = 0; index < m_spuVoices[core].size(); ++index)
++            {
++                auto &voice = m_spuVoices[core][index];
++                if (!voice.active)
++                    continue;
++                while (voice.sample >= voice.samples.size() && voice.active)
++                {
++                    const size_t overshoot = voice.sample - voice.samples.size();
++                    if ((voice.flags & 1u) != 0u)
++                    {
++                        if ((voice.flags & 2u) == 0u)
++                        {
++                            finishSpuVoice(offset, index);
++                            break;
++                        }
++                        m_hardware[base + 0x340u] |= 1u << index;
++                        voice.address = voice.loop;
++                    }
++                    decodeSpuBlock(voice);
++                    voice.sample += overshoot;
++                }
++                if (!voice.active)
++                    continue;
++
++                const int32_t sample = voice.samples[voice.sample];
++                const uint32_t volume = readHardware32(base + 16u * index);
++                const uint32_t master = readHardware32(Spu2Base + 0x760u + 40u * core);
++                for (uint32_t channel = 0; channel < 2; ++channel)
++                {
++                    const uint16_t level = (volume >> (16u * channel)) & 0x7FFFu;
++                    const int32_t gain = (static_cast<int32_t>(level) ^ 0x4000) - 0x4000;
++                    const auto masterGain = static_cast<int16_t>(master >> (16u * channel));
++                    mix[channel] += ((sample * gain / 0x4000) * masterGain) / 0x8000;
++                }
++                voice.phase += readHardware32(base + 16u * index + 4u) & 0x3FFFu;
++                voice.sample += voice.phase >> 12u;
++                voice.phase &= 0xFFFu;
++            }
++        }
++        for (size_t channel = 0; channel < output.size(); ++channel)
++            output[channel] = static_cast<int16_t>(std::clamp(mix[channel], -32768, 32767));
++    }
++
+     void IopMemory::transferSpuDma(uint32_t channel, uint32_t coreOffset, uint32_t control, uint64_t words)
+     {
+         // MADR is a byte address in IOP RAM. TSA is a halfword address in sound RAM.
+         const uint32_t iopAddress = readHardware32(channel - 8u) & 0x00FFFFFCu;
+-        const uint32_t tsa = readHardware32(kSpuTransferAddress + coreOffset);
+-        const uint32_t soundAddress = ((tsa << 16u) | (tsa >> 16u)) & kSpuRamMask;
++        const uint32_t soundAddress = spuAddress(kSpuTransferAddress + coreOffset);
+         if (iopAddress >= RamSize || words > (RamSize - iopAddress) / sizeof(uint32_t))
+             return;
+
+@@ -294,7 +487,10 @@ namespace ps2x::iop::detail
+         for (size_t index = 0; index < halfwords; ++index)
+         {
+             uint8_t *iop = m_ram.data() + iopAddress + index * sizeof(uint16_t);
+-            uint16_t &sound = m_spuRam[(soundAddress + index) & kSpuRamMask];
++            const uint32_t wordAddress = (soundAddress + index) & kSpuRamMask;
++            if (index != 0u)
++                checkSpuInterrupt(wordAddress);
++            uint16_t &sound = m_spuRam[wordAddress];
+             if (control & 1u)
+                 std::memcpy(&sound, iop, sizeof(sound));
+             else
+diff --git i/ps2xIOP/src/emulator/core/iop_memory.h w/ps2xIOP/src/emulator/core/iop_memory.h
+index 48531dc..9334ca9 100644
+--- i/ps2xIOP/src/emulator/core/iop_memory.h
++++ w/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,5 +1,6 @@
+ #pragma once
+
++#include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <optional>
+@@ -67,12 +68,33 @@ namespace ps2x::iop::detail
+         void setInterruptMask(uint32_t value) noexcept { m_interruptMask = value; }
+         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+
++        void mixSpuFrame(std::span<int16_t, 2> output);
++        [[nodiscard]] bool takeSpuInterrupt() noexcept;
++
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+
+     private:
++        struct SpuVoice
++        {
++            std::array<int16_t, 28> samples{};
++            uint32_t address = 0;
++            uint32_t loop = 0;
++            uint32_t phase = 0;
++            size_t sample = 28;
++            int32_t history = 0;
++            int32_t older = 0;
++            uint8_t flags = 0;
++            bool active = false;
++        };
++
++        [[nodiscard]] uint32_t spuAddress(uint32_t registerAddress) const;
++        void writeSpuRegister(uint32_t address, uint16_t value);
++        void decodeSpuBlock(SpuVoice &voice);
++        void checkSpuInterrupt(uint32_t wordAddress);
++        void finishSpuVoice(uint32_t coreOffset, size_t voice);
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
+@@ -82,6 +104,8 @@ namespace ps2x::iop::detail
+         std::vector<uint8_t> m_owned;
+         std::vector<uint8_t> m_scratch;
+         std::vector<uint16_t> m_spuRam;
++        std::array<std::array<SpuVoice, 24>, 2> m_spuVoices{};
++        bool m_spuInterrupt = false;
+         std::unordered_map<uint32_t, uint32_t> m_hardware;
+         std::vector<Allocation> m_allocations;
+         uint32_t m_heapCursor = HeapBase;
+diff --git i/ps2xIOP/tests/iop_import_tests.cpp w/ps2xIOP/tests/iop_import_tests.cpp
+index 3035618..391284d 100644
+--- i/ps2xIOP/tests/iop_import_tests.cpp
++++ w/ps2xIOP/tests/iop_import_tests.cpp
+@@ -8,6 +8,7 @@
+ #include "emulator/services/iop_rpc.h"
+ #include "ps2x/iop/iop_host.h"
+
++#include <array>
+ #include <cstdint>
+ #include <chrono>
+ #include <cstring>
+@@ -98,6 +99,47 @@ namespace
+         return false;
+     }
+
++    bool testSpuDmaVoicePlayback()
++    {
++        IopMemory memory;
++        constexpr uint32_t base = IopMemory::Spu2Base;
++        constexpr uint32_t sampleAddress = 0x2800u;
++        // One final ADPCM block with a zero predictor and 28 identical samples.
++        constexpr std::array<uint32_t, 4> block{
++            0x11110100u, 0x11111111u, 0x11111111u, 0x11111111u
++        };
++        if (!expect(memory.writeRam(0x1000u, block.data(), sizeof(block)), "could not seed SPU DMA source"))
++            return false;
++        memory.write32(base + 0x1A8u, sampleAddress << 16u);
++        memory.write32(0x1F8010C0u, 0x1000u);
++        memory.write32(0x1F8010C4u, 0x00010004u);
++        memory.write32(0x1F8010C8u, 0x01000201u);
++        if (!expect(memory.takeDmaStart().has_value(), "SPU DMA did not schedule completion"))
++            return false;
++
++        memory.write32(base + 0x1C0u, sampleAddress << 16u);
++        memory.write16(base, 0x2000u);
++        memory.write16(base + 2u, 0x1000u);
++        memory.write16(base + 4u, 0x1000u);
++        memory.write16(base + 0x760u, 0x4000u);
++        memory.write16(base + 0x762u, 0x4000u);
++        memory.write32(base + 0x19Cu, sampleAddress << 16u);
++        memory.write16(base + 0x19Au, 0x8040u);
++        memory.write16(base + 0x1A0u, 1u);
++
++        std::array<int16_t, 2> output{};
++        for (int i = 0; i < 28; ++i)
++        {
++            memory.mixSpuFrame(output);
++            if (!expect(output[0] == 1024 && output[1] == 512, "SPU decoded or mixed the DMA block incorrectly") ||
++                !expect(memory.takeSpuInterrupt() == (i == 0), "SPU address IRQ did not latch once"))
++                return false;
++        }
++        memory.mixSpuFrame(output);
++        return expect(output[0] == 0 && output[1] == 0, "SPU voice played past the end flag") &&
++               expect((memory.read16(base + 0x340u) & 1u) == 1u, "SPU voice did not set ENDX");
++    }
++
+     bool testLoadcoreRebootLibraryMode()
+     {
+         IopMemory memory;
+@@ -330,7 +372,7 @@ namespace
+
+ int main()
+ {
+-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
++    if (!testSpuDmaVoicePlayback() || !testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+         !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
