@@ -1,0 +1,61 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -243,20 +243,20 @@ inline std::filesystem::path g_cdrom_cwd;
+ inline std::string g_ps2_cwd_device = "host0";
+ 
+ static constexpr uint32_t kRpcPacketSize = 64;
+-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
++static constexpr uint32_t kRpcPacketPoolBase = 0x01FA0000;
+ static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
+-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
++static constexpr uint32_t kRpcServerPoolBase = 0x01FB0000;
+ static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcServerStride = 0x80;
+ static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
+ 
+-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
++static constexpr uint32_t kTlsPoolBase = 0x01FC0000;
+ static constexpr uint32_t kTlsPoolBytes = 0x00010000;
+ static constexpr uint32_t kTlsBlockSize = 0x100;
+ static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
+ 
+-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
++static constexpr uint32_t kBootModePoolBase = 0x01FD0000;
+ static constexpr uint32_t kBootModePoolBytes = 0x00001000;
+ 
+ static constexpr uint32_t kSifRpcModeNowait = 0x01;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -562,7 +562,7 @@ namespace ps2_syscalls
+         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
+ 
+         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
++        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FA0000u;
+         uint32_t heapLimit = kDefaultGuestHeapEnd;
+ 
+         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
+@@ -602,7 +602,7 @@ namespace ps2_syscalls
+     {
+         (void)rdram;
+ 
+-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
++        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01FA0000u;
+ 
+         const uint32_t ret = runtime
+                                  ? runtime->guestHeapLimit()
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -94,7 +94,7 @@ namespace
+     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
+     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
++    constexpr uint32_t kGuestHeapHardLimit = 0x01FA0000u;
+ 
+     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
+     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
