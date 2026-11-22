@@ -54,9 +54,7 @@
 {0x001C2CA8u, "sceMcChdir"},
 {0x001C2DE8u, "sceMcFormat"},
 {0x001C2EB8u, "sceMcDelete"},
-{0x001C3000u, "sceVu0MulMatrix"},
-{0x001C30A0u, "sceVu0UnitMatrix"},
-{0x001C30E0u, "sceVu0ViewScreenMatrix"},
+// Excluídos: sceVu0MulMatrix (HLE multiplica m1*m0 invertido), sceVu0UnitMatrix, sceVu0ViewScreenMatrix — usa código recompilado original.
 {0x001C3208u, "sceVpu0Reset"},
 {0x001C3A98u, "sceCdNcmdDiskReady"},
 {0x001C3B30u, "sceCdSync"},
