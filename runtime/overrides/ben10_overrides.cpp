@@ -427,20 +427,27 @@ namespace
                         std::fprintf(stderr, "[ben10-vu1] hash=%012llx.. pc=0x%04x calls=%llu\n",
                                      (unsigned long long)(k >> 16), (unsigned)(k & 0xFFFFu), (unsigned long long)c);
             });
-            ps2_vu1_register_native_executor([](uint64_t codeHash, VU1State &st, uint8_t *, uint32_t,
+            ps2_vu1_register_native_executor([](uint64_t codeHash, VU1State &st, uint8_t *, uint32_t dataSize,
                                                 GS &, PS2Memory *memory, uint64_t *, uint64_t *, bool) -> bool {
                 ++g_totalCalls;
                 auto &cnt = g_hashCalls[codeHash];
-                if (cnt == 0 && memory && memory->getVU1Code())
+                if (cnt == 0 && memory)
                 {
-                    char fname[512];
-                    std::snprintf(fname, sizeof(fname), "%s/vu1_%016llx.bin",
-                                  g_vuDumpDir.c_str(), (unsigned long long)codeHash);
-                    if (FILE *f = std::fopen(fname, "wb"))
+                    const bool isVu0 = (dataSize == PS2_VU0_DATA_SIZE);
+                    const uint8_t *codePtr = isVu0 ? memory->getVU0Code() : memory->getVU1Code();
+                    const uint32_t codeSz = isVu0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE;
+                    if (codePtr)
                     {
-                        std::fwrite(memory->getVU1Code(), 1, PS2_VU1_CODE_SIZE, f);
-                        std::fclose(f);
-                        std::fprintf(stderr, "[ben10-vu1] dumped %s (first pc=0x%04x)\n", fname, st.pc);
+                        char fname[512];
+                        std::snprintf(fname, sizeof(fname), "%s/%s_%016llx.bin",
+                                      g_vuDumpDir.c_str(), isVu0 ? "vu0" : "vu1", (unsigned long long)codeHash);
+                        if (FILE *f = std::fopen(fname, "wb"))
+                        {
+                            std::fwrite(codePtr, 1, codeSz, f);
+                            std::fclose(f);
+                            std::fprintf(stderr, "[ben10-vu] dumped %s (first pc=0x%04x, dataSize=%u)\n",
+                                         fname, st.pc, dataSize);
+                        }
                     }
                 }
                 ++cnt;
