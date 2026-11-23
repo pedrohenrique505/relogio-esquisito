@@ -1,0 +1,461 @@
+diff --git i/ps2xRuntime/src/lib/gs/gs_frontend.cpp w/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..2848146 100644
+--- i/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ w/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,3 +1,6 @@
++#include "runtime/ps2_perf.h"
++#include "runtime/ps2_gs_capture.h"
++#include "runtime/ps2_dbgstat.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+@@ -113,6 +116,7 @@ GS::GS()
+ 
+ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ {
++    gscapture::init(vram, vramSize);
+     m_localMemoryStorage = vram;
+     m_localMemorySize = vramSize;
+     m_privRegs = privRegs;
+@@ -125,6 +129,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+ void GS::reset()
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    gscapture::Event capture(10,nullptr,0);
++    if (m_gifSink)
++        m_gifSink->onReset();
+     std::memset(m_ctx, 0, sizeof(m_ctx));
+     m_prim = {};
+     m_primRegister = {};
+@@ -526,6 +533,45 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+ 
+ void GS::latchHostPresentationFrame()
+ {
++    std::unique_lock<std::recursive_mutex> captureState(m_stateMutex,std::defer_lock);
++    std::unique_lock<std::recursive_mutex> captureLock(gscapture::mutex,std::defer_lock);
++    if(gscapture::enabled()) { captureState.lock(); captureLock.lock(); }
++    if(gscapture::file && m_privRegs) {
++        uint64_t regs[]={m_privRegs->pmode,m_privRegs->smode2,m_privRegs->dispfb1,m_privRegs->display1,m_privRegs->dispfb2,m_privRegs->display2,m_privRegs->bgcolor,m_privRegs->smode1};
++        gscapture::record(5,regs,sizeof(regs));
++    }
++
++    if (m_gifSink)
++        m_gifSink->onLatch();
++    // A sink that supplies a live presentation frame (e.g. GPU scanout)
++    // replaces the CPU composition for the window only; the CPU backend
++    // stays authoritative for VRAM, readback and signals. Capture mode
++    // keeps the CPU path so references still describe the CPU VRAM.
++    if (m_gifSink && !gscapture::enabled())
++    {
++        std::vector<uint8_t> gpuPixels;
++        uint32_t gpuWidth = 0, gpuHeight = 0;
++        if (m_gifSink->copyPresentationFrame(gpuPixels, gpuWidth, gpuHeight) &&
++            gpuWidth != 0 && gpuHeight != 0 && gpuWidth <= kHostFrameWidth &&
++            gpuPixels.size() >= static_cast<size_t>(gpuWidth) * gpuHeight * 4u)
++        {
++            std::vector<uint8_t> framed(static_cast<size_t>(kHostFrameWidth) * gpuHeight * 4u, 0u);
++            for (uint32_t y = 0; y < gpuHeight; ++y)
++                std::memcpy(framed.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u,
++                            gpuPixels.data() + static_cast<size_t>(y) * gpuWidth * 4u,
++                            static_cast<size_t>(gpuWidth) * 4u);
++            std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
++            m_hostPresentationFrame = std::move(framed);
++            m_hostPresentationWidth = gpuWidth;
++            m_hostPresentationHeight = gpuHeight;
++            m_hostPresentationDisplayFbp = 0;
++            m_hostPresentationSourceFbp = 0;
++            m_hostPresentationUsedPreferred = false;
++            m_hasHostPresentationFrame = true;
++            return;
++        }
++    }
++    ps2perf::Scope perfScope(ps2perf::GS);
+     GSPresentationRequest request{};
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+@@ -548,6 +594,13 @@ void GS::latchHostPresentationFrame()
+             m_backend->Flush();
+             m_backend->Sync(GSSyncReason::Presentation);
+             frame = m_backend->Present(request);
++            if(gscapture::file) {
++                std::vector<uint8_t> reference;
++                m_backend->SnapshotVram(reference);
++                static uint32_t captureFrame=0;
++                if(++captureFrame % 30u == 0u) gscapture::record(6,reference.data(),reference.size());
++                std::fflush(gscapture::file);
++            }
+         }
+     }
+ 
+@@ -640,10 +693,15 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ 
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2perf::Scope perfScope(ps2perf::GS);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+ 
++    gscapture::Event capture(1, data, sizeBytes);
++    if (m_gifSink)
++        m_gifSink->onGifPacket(data, sizeBytes);
++    const bool skipRaster = (m_gifSink && m_gifSink->skipCpuRaster());
+     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+         return;
+ 
+@@ -684,6 +742,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+             nreg = 16;
+ 
+         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
++        if (dbgstat::gifBudget.fetch_sub(1, std::memory_order_relaxed) > 0)
++            std::cout << "[dbg:giftag] path=generic size=" << sizeBytes << " lo=0x" << std::hex << tagLo << " hi=0x" << tagHi << std::dec
++                      << " nloop=" << nloop << " flg=" << (int)flg << " nreg=" << nreg << " pre=" << ((tagLo >> 46) & 1)
++                      << " prim=0x" << std::hex << ((tagLo >> 47) & 0x7FF) << std::dec << " prmodecont=" << m_prmodecont << std::endl;
+ 
+         bool pre = ((tagLo >> 46) & 1) != 0;
+         if (pre)
+@@ -697,6 +759,27 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+         if (flg == GIF_FMT_PACKED)
+         {
++            if (skipRaster)
++            {
++                bool pureVertexOrNop = true;
++                for (uint32_t i = 0; i < nreg; ++i)
++                {
++                    const uint8_t reg = regs[i];
++                    if (!(reg <= 0x05u || reg == 0x0Au || reg == 0x0Cu || reg == 0x0Du || reg == 0x0Fu))
++                    {
++                        pureVertexOrNop = false;
++                        break;
++                    }
++                }
++                if (pureVertexOrNop)
++                {
++                    const uint64_t payloadBytes = static_cast<uint64_t>(nloop) * nreg * 16ull;
++                    if (payloadBytes > sizeBytes - offset)
++                        return;
++                    offset += static_cast<uint32_t>(payloadBytes);
++                    continue;
++                }
++            }
+             for (uint32_t loop = 0; loop < nloop; ++loop)
+             {
+                 for (uint32_t r = 0; r < nreg; ++r)
+@@ -739,6 +822,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2perf::Scope perfScope(ps2perf::GS);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16u || !m_backend)
+         return false;
+@@ -746,16 +830,40 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     if (!validatePackedGifPacket(data, sizeBytes))
+         return false;
+ 
++    gscapture::Event capture(1, data, sizeBytes);
++    if (m_gifSink)
++        m_gifSink->onGifPacket(data, sizeBytes);
++    const bool skipRaster = (m_gifSink && m_gifSink->skipCpuRaster());
+     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
+                                                 {
+         m_curQ = 1.0f;
+ 
+         recordGifTagDebugEventUnlocked(sizeBytes, tag.nloop, GIF_FMT_PACKED, tag.nreg);
++        if (dbgstat::gifBudget.fetch_sub(1, std::memory_order_relaxed) > 0)
++            std::cout << "[dbg:giftag] path=native size=" << sizeBytes << " lo=0x" << std::hex << tag.lo << std::dec
++                      << " nloop=" << tag.nloop << " nreg=" << tag.nreg << " pre=" << ((tag.lo >> 46) & 1)
++                      << " prim=0x" << std::hex << ((tag.lo >> 47) & 0x7FF) << std::dec << " prmodecont=" << m_prmodecont << std::endl;
+ 
+         const bool pre = ((tag.lo >> 46u) & 1u) != 0u;
+         if (pre)
+             writeRegisterUnlocked(GS_REG_PRIM, (tag.lo >> 47u) & 0x7FFu);
+ 
++        if (skipRaster)
++        {
++            bool pureVertexOrNop = true;
++            for (uint32_t i = 0u; i < tag.nreg; ++i)
++            {
++                const uint8_t reg = tag.regs[i];
++                if (!(reg <= 0x05u || reg == 0x0Au || reg == 0x0Cu || reg == 0x0Du || reg == 0x0Fu))
++                {
++                    pureVertexOrNop = false;
++                    break;
++                }
++            }
++            if (pureVertexOrNop)
++                return true;
++        }
++
+         uint32_t offset = tag.payloadOffset;
+         for (uint32_t loop = 0u; loop < tag.nloop; ++loop)
+         {
+@@ -784,7 +892,13 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            const uint8_t *data,
+                            uint32_t sizeBytes)
+ {
++    ps2perf::Scope perfScope(ps2perf::GS);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    uint64_t regs[]={bitbltbuf,trxpos,trxreg,trxdir};
++    gscapture::Event capture(3, regs, sizeof(regs));
++    if(gscapture::file) gscapture::record(4, data, sizeBytes);
++    if (m_gifSink)
++        m_gifSink->onNativeUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+ 
+@@ -1062,7 +1176,12 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ 
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
++    ps2perf::Scope perfScope(ps2perf::GS);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    uint64_t reg[]={regAddr,value};
++    gscapture::Event capture(2, reg, sizeof(reg));
++    if (m_gifSink)
++        m_gifSink->onRegister(regAddr, value);
+     writeRegisterUnlocked(regAddr, value);
+ }
+ 
+@@ -1240,7 +1359,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+-        m_backend->LoadClut(t, m_texclut);
++        if (!m_gifSink || !m_gifSink->skipCpuRaster())
++            m_backend->LoadClut(t, m_texclut);
+         break;
+     }
+     case GS_REG_CLAMP_1:
+@@ -1271,7 +1391,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
+         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
+         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+-        m_backend->LoadClut(t, m_texclut);
++        if (!m_gifSink || !m_gifSink->skipCpuRaster())
++            m_backend->LoadClut(t, m_texclut);
+         break;
+     }
+     case GS_REG_XYOFFSET_1:
+@@ -1527,6 +1648,9 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+ 
+ void GS::vertexKick(bool drawing)
+ {
++    if (m_gifSink && m_gifSink->skipCpuRaster())
++        return;
++
+     ++m_vtxCount;
+     ++m_vtxIndex;
+ 
+@@ -1576,6 +1700,9 @@ void GS::vertexKick(bool drawing)
+     if (drawing && m_backend)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
++        dbgstat::draws.fetch_add(1, std::memory_order_relaxed);
++        if (m_prim.tme) dbgstat::drawsTex.fetch_add(1, std::memory_order_relaxed);
++        dbgstat::drawsFbp[m_ctx[m_prim.ctxt].frame.fbp & 511u].fetch_add(1, std::memory_order_relaxed);
+         updatePreferredDisplaySourceForDraw(batch);
+         m_backend->Submit(batch);
+         recordDrawDebugEventUnlocked(needed);
+@@ -1610,6 +1737,8 @@ void GS::vertexKick(bool drawing)
+ 
+ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ {
++    if (m_gifSink && m_gifSink->skipCpuRaster())
++        return;
+     if (m_backend)
+         m_backend->UploadImage(data, sizeBytes);
+ }
+@@ -1618,18 +1747,34 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    uint32_t clear[]={contextIndex,rgba};
++    gscapture::Event capture(7,clear,sizeof(clear));
++    if (m_gifSink)
++        m_gifSink->onClear(contextIndex, rgba);
++    if (m_gifSink && m_gifSink->skipCpuRaster())
++        return true;
+     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+ }
+ 
+ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    uint32_t clear[]={m_prim.ctxt ? 1u : 0u,rgba};
++    gscapture::Event capture(7,clear,sizeof(clear));
++    if (m_gifSink)
++        m_gifSink->onClear(m_prim.ctxt ? 1u : 0u, rgba);
++    if (m_gifSink && m_gifSink->skipCpuRaster())
++        return true;
+     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+ }
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    ps2perf::Scope perfScope(ps2perf::GS);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    gscapture::Event capture(8,&maxBytes,sizeof(maxBytes));
++    if (m_gifSink)
++        m_gifSink->onLocalToHostRequest(maxBytes);
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+ 
+@@ -1660,6 +1805,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ 
+     m_backend = std::move(backend);
+     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
++    m_backend->setRasterEnabled(!m_gifSink || !m_gifSink->skipCpuRaster());
+ }
+ 
+ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+@@ -1671,6 +1817,10 @@ uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint
+ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    uint32_t values[]={psm,base,bw,x,y,value};
++    gscapture::Event capture(9,values,sizeof(values));
++    if (m_gifSink)
++        m_gifSink->onDirectWrite(psm, base, bw, x, y, value);
+     if (m_backend)
+         m_backend->WriteVram(psm, base, bw, x, y, value);
+ }
+diff --git i/ps2xRuntime/src/lib/ps2_memory.cpp w/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..59cbb09 100644
+--- i/ps2xRuntime/src/lib/ps2_memory.cpp
++++ w/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -12,6 +12,8 @@
+ 
+ namespace
+ {
++    std::atomic<bool> g_gifStatFqcDirty{false};
++
+     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
+     {
+         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
+@@ -355,6 +357,10 @@ bool PS2Memory::initialize(size_t ramSize)
+ 
+         // Initialize I/O registers
+         m_ioRegisters.clear();
++        // The kernel leaves the DMAC enabled (D_CTRL.DMAE) before the ELF runs.
++        // Games that read-modify-write D_CTRL without setting DMAE themselves
++        // would otherwise turn the whole DMAC off.
++        m_ioRegisters[0x1000E000u] = 0x1u;
+ 
+         // Initialize GS registers
+         memset(&gs_regs, 0, sizeof(gs_regs));
+@@ -413,9 +419,13 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ 
+     constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    auto gifStatIt = m_ioRegisters.find(kGifStat);
+-    if (gifStatIt != m_ioRegisters.end())
+-        gifStatIt->second &= ~kGifFqcMask;
++    if (g_gifStatFqcDirty.load(std::memory_order_relaxed))
++    {
++        g_gifStatFqcDirty.store(false, std::memory_order_relaxed);
++        auto gifStatIt = m_ioRegisters.find(kGifStat);
++        if (gifStatIt != m_ioRegisters.end())
++            gifStatIt->second &= ~kGifFqcMask;
++    }
+ 
+     uint32_t interruptMask = 0u;
+     for (size_t index = 0; index < m_eeTimers.size(); ++index)
+@@ -1346,6 +1356,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                     const int kMaxChainTags = 4096;
+                     std::vector<uint8_t> chainBuf;
++                    chainBuf.reserve(65536);
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                     {
+@@ -1677,6 +1688,7 @@ void PS2Memory::processPendingTransfers()
+         constexpr uint32_t kGifFqcMask = 0x1F000000u;
+         uint32_t &gifStat = m_ioRegisters[kGifStat];
+         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
++        g_gifStatFqcDirty.store(true, std::memory_order_relaxed);
+     }
+ 
+     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+@@ -1919,6 +1931,46 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+     return causes;
+ }
+ 
++namespace
++{
++    size_t findFirstGifEopPacketEndMem(const uint8_t *data, size_t sizeBytes, bool &outFoundEop)
++    {
++        outFoundEop = false;
++        size_t offset = 0u;
++        while (offset + 16u <= sizeBytes)
++        {
++            uint64_t tagLo = 0u;
++            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
++            offset += 16u;
++
++            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++            const bool eop = ((tagLo >> 15u) & 1u) != 0u;
++            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58u) & 0x3u);
++            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++
++            uint64_t payloadBytes = 0u;
++            if (flg == 0u)
++                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 16ull;
++            else if (flg == 1u)
++                payloadBytes = (static_cast<uint64_t>(nloop) * nreg * 8ull + 15ull) & ~15ull;
++            else
++                payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
++
++            if (payloadBytes > sizeBytes - offset)
++                return sizeBytes;
++            offset += static_cast<size_t>(payloadBytes);
++            if (eop)
++            {
++                outFoundEop = true;
++                return offset;
++            }
++        }
++        return sizeBytes;
++    }
++}
++
+ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ {
+     if (m_path3Masked || m_path3MaskedFifo.empty())
+@@ -1952,12 +2004,32 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+     {
+         if (m_path3Masked)
+         {
+-            m_path3MaskedFifo.emplace_back(data, data + sizeBytes);
++            // Split multi-EOP PATH3 transfers into individual EOP-delimited packets
++            // on enqueue so VIF1 MSKPATH3(0) pulses pop packets without O(N^2)
++            // front-erasing of a large byte buffer.
++            size_t off = 0u;
++            while (off + 16u <= sizeBytes)
++            {
++                bool foundEop = false;
++                const size_t pktLen = findFirstGifEopPacketEndMem(data + off, sizeBytes - off, foundEop);
++                if (pktLen < 16u)
++                    break;
++                m_path3MaskedFifo.emplace_back(data + off, data + off + pktLen);
++                off += pktLen;
++                if (!foundEop)
++                    break;
++            }
+             return;
+         }
+         flushMaskedPath3Packets(false);
+     }
+ 
++    if (drainImmediately && m_gifPacketCallback && (!m_gifArbiter || m_gifArbiter->empty()))
++    {
++        m_gifPacketCallback(data, sizeBytes);
++        return;
++    }
++
+     if (m_gifArbiter)
+         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+     else if (m_gifPacketCallback)
